@@ -1,173 +1,160 @@
+cat > fetch_models.sh <<'SCRIPT_EOF'
 #!/usr/bin/env bash
-# saniora setup — cài ComfyUI + tải models H3 + venv API trong 1 lệnh.
+# ============================================================================
+# saniora — tải model H3 lên RunPod Network Volume (standalone, không cần repo)
 #
-# Usage:
-#   bash scripts/setup.sh
-#   COMFYUI_DIR=/opt/ComfyUI bash scripts/setup.sh   # thư mục cài ComfyUI
-#   HF_TOKEN=hf_xxx bash scripts/setup.sh            # model gated cần auth
-#   SKIP_COMFYUI=1 bash scripts/setup.sh             # đã có ComfyUI rồi
-#   SKIP_MODELS=1  bash scripts/setup.sh             # đã tải models rồi
-#   SKIP_TURBO_LORA=1 bash scripts/setup.sh          # đã có Turbo LoRA rồi / không cần Turbo
-#   SKIP_API=1     bash scripts/setup.sh             # đã có venv API rồi
-#   COMFYUI_REF=v0.31.1 bash scripts/setup.sh         # pin version ComfyUI (mặc định v0.31.1,
-#                                                      # tránh regression H3 chậm ~4x ở v0.32.0+)
-#   MODEL_ROOT=/workspace/models bash scripts/setup.sh
-#       # models đã tải sẵn (hoặc sẽ được tải vào) một thư mục RIÊNG, tách khỏi
-#       # COMFYUI_DIR — hữu ích khi ComfyUI nằm trong container tạm còn model
-#       # nằm trên Network Volume RunPod, muốn giữ nguyên qua các lần rebuild.
-#       # setup.sh sẽ symlink $COMFYUI_DIR/models -> $MODEL_ROOT, mọi download
-#       # sau đó vào thẳng $MODEL_ROOT nên lần chạy sau (volume vẫn còn) sẽ
-#       # tự skip vì file đã có sẵn.
+# Chạy trên POD TẠM có gắn Network Volume (mount tại /workspace).
+# Tải ~61.5 GiB / 66 GB → cần volume >= 80GB.
 #
-# Idempotent: clone/download chỉ cái thiếu, cái có sẵn thì bỏ qua.
+#   bash fetch_models.sh
+#   DEST=/workspace/comfyui bash fetch_models.sh   # đổi đích nếu cần
+#   SKIP_SPACE_CHECK=1 bash fetch_models.sh        # nếu df báo sai trên network mount
+#
+# Chạy lại được nhiều lần: file nào đủ dung lượng thì bỏ qua, thiếu/cụt thì tải lại.
+# ============================================================================
 set -euo pipefail
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMFYUI_DIR="${COMFYUI_DIR:-/workspace/saniora/ComfyUI}"
-MODEL_ROOT="${MODEL_ROOT:-$COMFYUI_DIR/models}"
-COMFYUI_GIT_URL="https://github.com/comfyanonymous/ComfyUI"
-# Pin: ComfyUI v0.32.0 (11/8/2026) trở lên có regression làm MiniMax H3 chậm
-# ~4x ở full-res, do PR #15486 ("fix peak memory issue with H3", v = v.clone())
-# — xem https://github.com/Comfy-Org/ComfyUI/issues/15665 (còn open, xác nhận
-# ảnh hưởng cả v0.33.1). v0.31.1 đã có đầy đủ MiniMax H3 R2V (native từ
-# v0.30.0, 3/8/2026: 9 ref ảnh + 3 ref video + 3 ref audio) và KHÔNG dính
-# regression này — override bằng COMFYUI_REF=<tag/commit> nếu upstream đã fix.
-COMFYUI_REF="${COMFYUI_REF:-v0.31.1}"
-HF_TOKEN="${HF_TOKEN:-}"
+
+DEST="${DEST:-/workspace/comfyui}"
 PY="${PY:-python3}"
 
-# repo|repo_relative_path|target_subdir_trong_models|revision (commit SHA, pinned
-# 2026-08-23 — xem docs/MiniMax_H3_Turbo_LoRA_Implementation_Guide.md; đổi revision
-# ở đây có chủ đích sau khi đã benchmark, không để `hf download` tự trôi theo main)
-LORAS=(
-  "drbaph/MiniMax-H3-Turbo-Lora-ComfyUI|minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors|loras|4728c77ec8c0a32b9ec62a128f6c118372f5fa1f"
-  "lightx2v/Minimax-h3-Turbo|minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors|loras|ec01fa4c86263832faa0bd1d6d8f36a281eaabb2"
+# repo | đường dẫn trong repo | thư mục đích | commit SHA (pin) | dung lượng byte
+FILES=(
+  "drbaph/MiniMax-H3-Turbo-Lora-ComfyUI|minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors|loras|4728c77ec8c0a32b9ec62a128f6c118372f5fa1f|620285592"
+  "lightx2v/Minimax-h3-Turbo|minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors|loras|ec01fa4c86263832faa0bd1d6d8f36a281eaabb2|1956193000"
+  "Comfy-Org/MiniMax-H3|diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors|diffusion_models|6701b0a14feefd7141bd9cfe8386961c27007622|20970379616"
+  "Comfy-Org/MiniMax-H3|diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors|diffusion_models|6701b0a14feefd7141bd9cfe8386961c27007622|20970379616"
+  "Comfy-Org/MiniMax-H3|text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|text_encoders|6701b0a14feefd7141bd9cfe8386961c27007622|15687142551"
+  "Comfy-Org/MiniMax-H3|vae/minimax_h3_video_vae_fp16.safetensors|vae|6701b0a14feefd7141bd9cfe8386961c27007622|5207808496"
+  "Comfy-Org/MiniMax-H3|vae/minimax_h3_audio_vae_fp32.safetensors|vae|6701b0a14feefd7141bd9cfe8386961c27007622|605254808"
 )
-MODELS=(
-  "Comfy-Org/MiniMax-H3|diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors|diffusion_models|6701b0a14feefd7141bd9cfe8386961c27007622"
-  "Comfy-Org/MiniMax-H3|diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors|diffusion_models|6701b0a14feefd7141bd9cfe8386961c27007622"
-  "Comfy-Org/MiniMax-H3|text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors|text_encoders|6701b0a14feefd7141bd9cfe8386961c27007622"
-  "Comfy-Org/MiniMax-H3|vae/minimax_h3_video_vae_fp16.safetensors|vae|6701b0a14feefd7141bd9cfe8386961c27007622"
-  "Comfy-Org/MiniMax-H3|vae/minimax_h3_audio_vae_fp32.safetensors|vae|6701b0a14feefd7141bd9cfe8386961c27007622"
-)
+
+need_bytes=0
+for e in "${FILES[@]}"; do
+  need_bytes=$(( need_bytes + $(cut -d'|' -f5 <<<"$e") ))
+done
 
 step() { printf '\n==> %s\n' "$1"; }
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 bytes"; }
 
-# --- 1. ComfyUI -------------------------------------------------------------
-if [ "${SKIP_COMFYUI:-0}" = "1" ]; then
-  step "SKIP_COMFYUI=1 — bỏ qua cài ComfyUI"
-else
-  if [ -d "$COMFYUI_DIR/.git" ]; then
-    step "ComfyUI đã có tại $COMFYUI_DIR — bỏ qua clone"
-    echo "   (đang ở: $(git -C "$COMFYUI_DIR" describe --tags 2>/dev/null || git -C "$COMFYUI_DIR" rev-parse --short HEAD))"
-    echo "   KHÔNG nên 'git pull' bừa — v0.32.0+ có regression chậm H3 (xem"
-    echo "   ghi chú COMFYUI_REF ở đầu file). Muốn đổi version: cd $COMFYUI_DIR && git checkout <tag>"
-  else
-    step "Clone ComfyUI → $COMFYUI_DIR (pin $COMFYUI_REF)"
-    git clone "$COMFYUI_GIT_URL" "$COMFYUI_DIR"
-    git -C "$COMFYUI_DIR" checkout "$COMFYUI_REF"
+# --- 0. Kiểm tra volume + dung lượng trống -----------------------------------
+step "Kiểm tra đích: $DEST"
+vol_root="$(df -P "$(dirname "$DEST")" 2>/dev/null | awk 'NR==2{print $6}')" || true
+if [ -z "${vol_root:-}" ]; then
+  echo "   ⚠ Không đọc được filesystem của $(dirname "$DEST") — volume đã mount chưa?"
+  exit 1
+fi
+avail_kb="$(df -P "$(dirname "$DEST")" | awk 'NR==2{print $4}')"
+avail_bytes=$(( avail_kb * 1024 ))
+echo "   filesystem : $vol_root"
+echo "   cần        : $(human "$need_bytes")"
+echo "   còn trống  : $(human "$avail_bytes")"
+
+# Trừ đi phần đã tải xong (cho phép chạy lại khi volume gần đầy)
+have_bytes=0
+for e in "${FILES[@]}"; do
+  IFS='|' read -r _ path subdir _ size <<<"$e"
+  f="$DEST/models/$subdir/$(basename "$path")"
+  if [ -f "$f" ] && [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" = "$size" ]; then
+    have_bytes=$(( have_bytes + size ))
   fi
-
-  step "Cài dependencies ComfyUI ($PY)"
-  "$PY" -m pip install -r "$COMFYUI_DIR/requirements.txt"
+done
+still=$(( need_bytes - have_bytes ))
+if [ "${SKIP_SPACE_CHECK:-0}" = "1" ]; then
+  echo "   (SKIP_SPACE_CHECK=1 — bỏ qua kiểm tra dung lượng)"
+elif [ "$still" -gt 0 ] && [ "$avail_bytes" -lt "$still" ]; then
+  echo
+  echo "   ✗ KHÔNG ĐỦ CHỖ. Còn phải tải $(human "$still") nhưng chỉ trống $(human "$avail_bytes")."
+  echo "     Volume cần >= 80GB (RunPod bán theo GB thập phân: 60GB thật ra chỉ ~55.9 GiB)."
+  exit 1
 fi
 
-# --- 2. Models H3 ------------------------------------------------------------
-# Trỏ $COMFYUI_DIR/models vào $MODEL_ROOT (storage bền, vd Network Volume).
-# Nếu MODEL_ROOT == $COMFYUI_DIR/models (mặc định) thì không làm gì cả.
-if [ "$(readlink -f "$MODEL_ROOT" 2>/dev/null || echo "$MODEL_ROOT")" \
-     != "$(readlink -f "$COMFYUI_DIR/models" 2>/dev/null || echo "$COMFYUI_DIR/models")" ]; then
-  step "Link models → storage bền: $COMFYUI_DIR/models -> $MODEL_ROOT"
-  mkdir -p "$MODEL_ROOT"
-  if [ -L "$COMFYUI_DIR/models" ]; then
-    rm -f "$COMFYUI_DIR/models"
-  elif [ -d "$COMFYUI_DIR/models" ]; then
-    echo "   ⚠ $COMFYUI_DIR/models đã tồn tại (không phải symlink)."
-    echo "     Merge thủ công vào $MODEL_ROOT rồi xoá thư mục cũ, hoặc đổi MODEL_ROOT."
-    exit 1
-  fi
-  ln -s "$MODEL_ROOT" "$COMFYUI_DIR/models"
+# --- 1. Cài huggingface_hub (CLI `hf`) ---------------------------------------
+# -U là bắt buộc: `pip install <pkg>` bỏ qua hoàn toàn package đã cài sẵn,
+# mà CLI `hf` chỉ có từ huggingface_hub >= 0.34 (bản cũ chỉ có `huggingface-cli`).
+step "Cài huggingface_hub (CLI 'hf')"
+"$PY" -m pip install -q -U "huggingface_hub>=0.34"
+if ! command -v hf >/dev/null 2>&1; then
+  export PATH="$("$PY" -c 'import site;print(site.USER_BASE)')/bin:$PATH"
 fi
+command -v hf >/dev/null 2>&1 || { echo "   ✗ Không thấy lệnh 'hf' trên PATH."; exit 1; }
+echo "   hf: $(command -v hf)"
 
-# Tải 1 file từ HF repo vào $COMFYUI_DIR/models/$subdir/<basename path>.
-#
-# QUAN TRỌNG: không gọi `hf download ... --local-dir "$COMFYUI_DIR/models/$subdir"`
-# trực tiếp — khi $path đã có tiền tố thư mục (vd "vae/foo.safetensors"), hf
-# download giữ nguyên cấu trúc đó bên trong --local-dir, tạo ra đường dẫn lồng
-# trùng tên: models/vae/vae/foo.safetensors thay vì models/vae/foo.safetensors.
-# Thay vào đó: tải vào thư mục tạm, rồi mv đúng 1 file ra đích tường minh.
-dl_from() {
-  local repo="$1" path="$2" subdir="$3" revision="${4:-}"
-  local fname target tmp
+# --- 2. Tải ------------------------------------------------------------------
+# Không gọi `hf download --local-dir "$DEST/models/$subdir"` trực tiếp: khi path
+# đã có tiền tố thư mục (vd "vae/foo.safetensors"), hf giữ nguyên cấu trúc đó
+# bên trong --local-dir → tạo ra models/vae/vae/foo.safetensors. Vì vậy: tải vào
+# thư mục tạm rồi mv đúng 1 file ra đích (cùng filesystem nên mv là rename, tức thời).
+tmp=""
+cleanup() { [ -n "$tmp" ] && [ -d "$tmp" ] && rm -rf "$tmp"; }
+trap cleanup EXIT INT TERM
+
+i=0
+for e in "${FILES[@]}"; do
+  i=$(( i + 1 ))
+  IFS='|' read -r repo path subdir rev size <<<"$e"
   fname="$(basename "$path")"
-  target="$COMFYUI_DIR/models/$subdir/$fname"
-  if [ -f "$target" ] && [ -s "$target" ]; then
-    printf '   ✓ có sẵn %s (%s)\n' "$target" "$(du -h "$target" | cut -f1)"
-    return
+  target="$DEST/models/$subdir/$fname"
+
+  if [ -f "$target" ]; then
+    actual="$(stat -c%s "$target" 2>/dev/null || echo 0)"
+    if [ "$actual" = "$size" ]; then
+      printf '\n[%d/%d] ✓ có sẵn, đúng dung lượng: %s\n' "$i" "${#FILES[@]}" "$fname"
+      continue
+    fi
+    printf '\n[%d/%d] ⚠ %s có nhưng SAI dung lượng (%s ≠ %s) — tải lại\n' \
+      "$i" "${#FILES[@]}" "$fname" "$actual" "$size"
+    rm -f "$target"
   fi
-  printf '   ↓ tải %s (từ %s%s)\n' "$path" "$repo" "${revision:+ @ ${revision:0:8}}"
-  mkdir -p "$COMFYUI_DIR/models/$subdir"
-  tmp="$(mktemp -d "$COMFYUI_DIR/models/.dl_tmp.XXXXXX")"
-  if [ -n "$revision" ]; then
-    hf download "$repo" "$path" --revision "$revision" --local-dir "$tmp"
-  else
-    hf download "$repo" "$path" --local-dir "$tmp"
-  fi
+
+  printf '\n[%d/%d] ↓ %s  (%s, từ %s @ %s)\n' \
+    "$i" "${#FILES[@]}" "$fname" "$(human "$size")" "$repo" "${rev:0:8}"
+  mkdir -p "$DEST/models/$subdir"
+  tmp="$(mktemp -d "$DEST/models/.dl_tmp.XXXXXX")"
+  hf download "$repo" "$path" --revision "$rev" --local-dir "$tmp"
   mv "$tmp/$path" "$target"
-  rm -rf "$tmp"
-}
+  rm -rf "$tmp"; tmp=""
+done
 
-# CLI `hf` mà dl_from() dùng đến từ huggingface_hub — phải cài TRƯỚC cả hai khối
-# tải bên dưới, vì khối LoRA chạy trước khối models. `-U` là bắt buộc chứ không
-# phải cho đẹp: `pip install <pkg>` bỏ qua hoàn toàn package đã cài sẵn, mà CLI
-# `hf` chỉ có từ huggingface_hub >= 0.34 (bản cũ chỉ có `huggingface-cli`).
-if [ "${SKIP_TURBO_LORA:-0}" != "1" ] || [ "${SKIP_MODELS:-0}" != "1" ]; then
-  step "Cài huggingface_hub (cung cấp CLI 'hf')"
-  "$PY" -m pip install -q -U "huggingface_hub>=0.34"
-  if ! command -v hf >/dev/null 2>&1; then
-    echo "   ⚠ Không thấy lệnh 'hf' trên PATH sau khi cài huggingface_hub."
-    echo "     Thử: export PATH=\"\$($PY -c 'import site;print(site.USER_BASE)')/bin:\$PATH\""
-    exit 1
-  fi
-  if [ -n "${HF_TOKEN:-}" ]; then
-    export HF_TOKEN
-    echo "   Dùng HF_TOKEN từ env (đã set)"
+# --- 3. Verify ---------------------------------------------------------------
+step "Kiểm tra kết quả"
+fail=0
+for e in "${FILES[@]}"; do
+  IFS='|' read -r _ path subdir _ size <<<"$e"
+  fname="$(basename "$path")"
+  target="$DEST/models/$subdir/$fname"
+  actual="$(stat -c%s "$target" 2>/dev/null || echo 0)"
+  if [ "$actual" = "$size" ]; then
+    printf '   ✓ %-18s %-56s %s\n' "$subdir" "$fname" "$(human "$size")"
   else
-    echo "   Lưu ý: chưa có HF_TOKEN. Nếu tải bị 401 (model gated) → chạy lại với HF_TOKEN=hf_xxx"
+    printf '   ✗ %-18s %-56s có %s, cần %s\n' "$subdir" "$fname" "$actual" "$size"
+    fail=1
   fi
+done
+
+echo
+du -sh "$DEST"/models/* 2>/dev/null || true
+echo
+df -h "$vol_root" | awk 'NR==1||NR==2'
+
+if [ "$fail" = 1 ]; then
+  echo
+  echo "✗ Có file chưa đúng — chạy lại script (nó sẽ chỉ tải phần thiếu)."
+  exit 1
 fi
 
-if [ "${SKIP_TURBO_LORA:-0}" = "1" ]; then
-  step "SKIP_TURBO_LORA=1 — bỏ qua tải Turbo LoRA"
-else
-  step "Tải H3 Turbo LoRA (~2.4GiB: REF2VA Larry v4-600 EMA pruned 0.58 + FL2VA LightX2V 8-step 1.82)"
-  for entry in "${LORAS[@]}"; do
-    IFS='|' read -r repo path subdir revision <<< "$entry"
-    dl_from "$repo" "$path" "$subdir" "$revision"
-  done
-fi
+cat <<EOF
 
-if [ "${SKIP_MODELS:-0}" = "1" ]; then
-  step "SKIP_MODELS=1 — bỏ qua tải models"
-else
-  step "Tải models H3 (~59GiB: 2 diffusion 19.53 mỗi cái + TE 14.61 + 2 VAE 5.41; skip file đã có)"
-  for entry in "${MODELS[@]}"; do
-    IFS='|' read -r repo path subdir revision <<< "$entry"
-    dl_from "$repo" "$path" "$subdir" "$revision"
-  done
-fi
+✓ XONG — đủ ${#FILES[@]} file, tổng $(human "$need_bytes").
 
-# --- 3. API venv --------------------------------------------------------------
-if [ "${SKIP_API:-0}" = "1" ]; then
-  step "SKIP_API=1 — bỏ qua venv API"
-else
-  step "Tạo venv + cài saniora (API)"
-  cd "$REPO_DIR"
-  [ -d .venv ] || "$PY" -m venv .venv
-  # shellcheck disable=SC1091
-  source .venv/bin/activate
-  pip install -e ".[dev]"
-fi
+Cấu trúc trên volume giờ là:
+  $DEST/models/{diffusion_models,text_encoders,vae,loras}/
 
-step "Xong. Tiếp theo:"
-echo "  1) bash scripts/start.sh                     # launch ComfyUI (nếu chưa chạy) + API"
-echo "  2) Kiểm tra: curl http://127.0.0.1:8000/health"
+Worker Serverless sẽ thấy đúng chỗ này dưới tên /runpod-volume/comfyui/models
+(cùng volume, RunPod mount /workspace cho Pod và /runpod-volume cho Serverless),
+khớp base_path trong extra_model_paths.yaml.
+
+Tiếp theo: xoá pod tạm này (volume giữ nguyên data) → trỏ endpoint vào volume mới.
+EOF
+SCRIPT_EOF
+
+bash fetch_models.sh
