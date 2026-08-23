@@ -2,12 +2,10 @@
 # ============================================================================
 # saniora — tải model H3 lên RunPod Network Volume (standalone, không cần repo)
 #
-# Chạy trên POD TẠM có gắn Network Volume (mount tại /workspace).
-# Tải ~61.5 GiB / 66 GB → cần volume >= 80GB.
-#
 #   bash fetch_models.sh
 #   DEST=/workspace/comfyui bash fetch_models.sh   # đổi đích nếu cần
 #   SKIP_SPACE_CHECK=1 bash fetch_models.sh        # nếu df báo sai trên network mount
+#   PY=python3.13 bash fetch_models.sh             # ép dùng python cụ thể
 #
 # Chạy lại được nhiều lần: file nào đủ dung lượng thì bỏ qua, thiếu/cụt thì tải lại.
 # ============================================================================
@@ -48,7 +46,6 @@ echo "   filesystem : $vol_root"
 echo "   cần        : $(human "$need_bytes")"
 echo "   còn trống  : $(human "$avail_bytes")"
 
-# Trừ đi phần đã tải xong (cho phép chạy lại khi volume gần đầy)
 have_bytes=0
 for e in "${FILES[@]}"; do
   IFS='|' read -r _ path subdir _ size <<<"$e"
@@ -67,22 +64,42 @@ elif [ "$still" -gt 0 ] && [ "$avail_bytes" -lt "$still" ]; then
   exit 1
 fi
 
-# --- 1. Cài huggingface_hub (CLI `hf`) ---------------------------------------
-# -U là bắt buộc: `pip install <pkg>` bỏ qua hoàn toàn package đã cài sẵn,
-# mà CLI `hf` chỉ có từ huggingface_hub >= 0.34 (bản cũ chỉ có `huggingface-cli`).
-step "Cài huggingface_hub (CLI 'hf')"
-"$PY" -m pip install -q -U "huggingface_hub>=0.34"
-if ! command -v hf >/dev/null 2>&1; then
-  export PATH="$("$PY" -c 'import site;print(site.USER_BASE)')/bin:$PATH"
+# --- 1. Tìm Python có huggingface_hub ----------------------------------------
+# Image RunPod thường có NHIỀU python: /usr/bin/python3 trần (không có pip) và
+# một bản khác (vd python3.13 ở /usr/local) chứa site-packages thật. Nên:
+#  1) tìm interpreter nào import được huggingface_hub → dùng luôn, khỏi cài;
+#  2) chỉ khi không có mới đi cài, qua trình pip nào thực sự chạy được.
+# Dùng Python API (hf_hub_download) thay cho CLI `hf` → không phụ thuộc PATH.
+step "Tìm Python có huggingface_hub"
+PYBIN=""
+for cand in "$PY" python3 python3.13 python3.12 python3.11 python; do
+  command -v "$cand" >/dev/null 2>&1 || continue
+  if "$cand" -c "import huggingface_hub" >/dev/null 2>&1; then PYBIN="$cand"; break; fi
+done
+
+if [ -z "$PYBIN" ]; then
+  echo "   chưa có huggingface_hub — thử cài"
+  installed=0
+  for cand in "$PY -m pip" python3.13\ -m\ pip pip3 pip "python3 -m pip"; do
+    $cand --version >/dev/null 2>&1 || continue
+    echo "   dùng: $cand"
+    $cand install -q -U "huggingface_hub>=0.34" && installed=1 && break
+  done
+  [ "$installed" = 1 ] || { echo "   ✗ Không cài được huggingface_hub. Thử tay: pip install -U huggingface_hub"; exit 1; }
+  for cand in "$PY" python3 python3.13 python3.12 python3.11 python; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    if "$cand" -c "import huggingface_hub" >/dev/null 2>&1; then PYBIN="$cand"; break; fi
+  done
 fi
-command -v hf >/dev/null 2>&1 || { echo "   ✗ Không thấy lệnh 'hf' trên PATH."; exit 1; }
-echo "   hf: $(command -v hf)"
+[ -n "$PYBIN" ] || { echo "   ✗ Cài xong vẫn không import được huggingface_hub."; exit 1; }
+echo "   python : $(command -v "$PYBIN")"
+echo "   version: $("$PYBIN" -c 'import huggingface_hub as h;print(h.__version__)')"
 
 # --- 2. Tải ------------------------------------------------------------------
-# Không gọi `hf download --local-dir "$DEST/models/$subdir"` trực tiếp: khi path
-# đã có tiền tố thư mục (vd "vae/foo.safetensors"), hf giữ nguyên cấu trúc đó
-# bên trong --local-dir → tạo ra models/vae/vae/foo.safetensors. Vì vậy: tải vào
-# thư mục tạm rồi mv đúng 1 file ra đích (cùng filesystem nên mv là rename, tức thời).
+# Tải vào thư mục tạm rồi mv ra đích. hf_hub_download giữ nguyên cấu trúc thư mục
+# của `path` bên trong local_dir (vd vae/foo.safetensors), nên KHÔNG trỏ thẳng vào
+# đích được — nhưng nó trả về đường dẫn thật, khỏi phải đoán. mv cùng filesystem
+# là rename, tức thời, không tốn thêm chỗ.
 tmp=""
 cleanup() { [ -n "$tmp" ] && [ -d "$tmp" ] && rm -rf "$tmp"; }
 trap cleanup EXIT INT TERM
@@ -109,8 +126,15 @@ for e in "${FILES[@]}"; do
     "$i" "${#FILES[@]}" "$fname" "$(human "$size")" "$repo" "${rev:0:8}"
   mkdir -p "$DEST/models/$subdir"
   tmp="$(mktemp -d "$DEST/models/.dl_tmp.XXXXXX")"
-  hf download "$repo" "$path" --revision "$rev" --local-dir "$tmp"
-  mv "$tmp/$path" "$target"
+  got="$("$PYBIN" - "$repo" "$path" "$rev" "$tmp" <<'PYDL'
+import sys
+from huggingface_hub import hf_hub_download
+repo, path, rev, dest = sys.argv[1:5]
+print(hf_hub_download(repo_id=repo, filename=path, revision=rev, local_dir=dest))
+PYDL
+)"
+  [ -f "$got" ] || { echo "   ✗ Không thấy file sau khi tải: $got"; exit 1; }
+  mv "$got" "$target"
   rm -rf "$tmp"; tmp=""
 done
 
@@ -140,4 +164,3 @@ if [ "$fail" = 1 ]; then
   echo "✗ Có file chưa đúng — chạy lại script (nó sẽ chỉ tải phần thiếu)."
   exit 1
 fi
-
