@@ -1,4 +1,3 @@
-cat > fetch_models.sh <<'SCRIPT_EOF'
 #!/usr/bin/env bash
 # ============================================================================
 # saniora — tải model H3 lên RunPod Network Volume (standalone, không cần repo)
@@ -142,19 +141,3 @@ if [ "$fail" = 1 ]; then
   exit 1
 fi
 
-cat <<EOF
-
-✓ XONG — đủ ${#FILES[@]} file, tổng $(human "$need_bytes").
-
-Cấu trúc trên volume giờ là:
-  $DEST/models/{diffusion_models,text_encoders,vae,loras}/
-
-Worker Serverless sẽ thấy đúng chỗ này dưới tên /runpod-volume/comfyui/models
-(cùng volume, RunPod mount /workspace cho Pod và /runpod-volume cho Serverless),
-khớp base_path trong extra_model_paths.yaml.
-
-Tiếp theo: xoá pod tạm này (volume giữ nguyên data) → trỏ endpoint vào volume mới.
-EOF
-SCRIPT_EOF
-
-bash fetch_models.sh
